@@ -96,9 +96,13 @@ class FvcomDataset(Dataset):
 
 class LinearAttention(nn.Module):
     """
-    线性注意力机制实现 (Linear Transformer / Performer style)
-    复杂度: O(N * d^2) 而不是 O(N^2 * d)
-    适用于长序列 (如 60k+ nodes)
+    通用线性注意力模块 (Generalized Linear Attention)
+    
+    特性:
+    1. 支持 Self-Attention (Q, K, V 长度相同)
+    2. 支持 Cross-Attention (Q 长度 != K/V 长度)
+    3. 时间复杂度: O((N_q + N_k) * d^2)，空间复杂度: O(N * d)
+    4. 使用 ELU+1 作为特征映射函数 (Feature Map) 以近似 Softmax
     """
     def __init__(self, embed_dim, n_heads, dropout=0.1):
         super().__init__()
@@ -108,280 +112,277 @@ class LinearAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = embed_dim // n_heads
         
-        # 合并 Q, K, V 投影以简化代码，类似原生 MultiheadAttention
-        self.in_proj = nn.Linear(embed_dim, embed_dim * 3)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # 特征映射函数：ELU + 1 保证正值，这是线性注意力的关键
-        # 也可以使用 ReLU，但 ELU+1 在实验中通常更稳定
-        self.feature_map = lambda x: F.elu(x) + 1.0
-
-    def forward(self, query, key, value, key_padding_mask=None, need_weights=False):
-        """
-        query: [B, N_q, D]
-        key:   [B, N_k, D]
-        value: [B, N_k, D]
-        """
-        B, N_q, D = query.shape
-        N_k = key.shape[1]
-        
-        # 1. 投影 Q, K, V
-        qkv = self.in_proj(torch.cat([query, key, value], dim=-1)) # [B, N, 3D] (注意这里如果是 cross attention，长度可能不同，需分开处理)
-        
-        # 为了处理 Cross Attention (Q 和 K/V 长度不同)，我们分开投影
-        q = self.in_proj.weight[:D, :] @ query.transpose(-1, -2) + self.in_proj.bias[:D] # [B, D, N_q]
-        k = self.in_proj.weight[D:2*D, :] @ key.transpose(-1, -2) + self.in_proj.bias[D:2*D]       # [B, D, N_k]
-        v = self.in_proj.weight[2*D:, :] @ value.transpose(-1, -2) + self.in_proj.bias[2*D:]       # [B, D, N_k]
-        
-        # 转回 [B, Heads, Seq_Len, Head_Dim]
-        q = q.reshape(B, self.n_heads, self.head_dim, N_q).transpose(2, 3) # [B, H, N_q, h]
-        k = k.reshape(B, self.n_heads, self.head_dim, N_k).transpose(2, 3) # [B, H, N_k, h]
-        v = v.reshape(B, self.n_heads, self.head_dim, N_k).transpose(2, 3) # [B, H, N_k, h]
-
-        # 2. 应用特征映射 (Feature Map) 替代 Softmax
-        # 这一步将负值变为正值，使得我们可以交换矩阵乘法顺序
-        q = self.feature_map(q)
-        k = self.feature_map(k)
-        
-        # 3. 线性注意力核心计算
-        # 标准注意力: Softmax(QK^T)V
-        # 线性注意力: (Q * (K^T * V)) / (Q * (K^T * 1))
-        
-        # 计算 KV 态 (State): [B, H, head_dim, head_dim]
-        # 对序列维度 N_k 进行求和压缩
-        kv = torch.einsum("bhnd,bhnm->bhdm", k, v) 
-        
-        # 计算归一化分母态: [B, H, head_dim, 1]
-        z = 1.0 / (torch.einsum("bhnd,bhd->bhn", q, k.sum(dim=2)) + 1e-6)
-        
-        # 计算输出: [B, H, N_q, head_dim]
-        out = torch.einsum("bhdm,bhn->bhnd", kv, q)
-        
-        # 应用归一化
-        out = out * z.unsqueeze(-1)
-        
-        # 4. 合并头并投影输出
-        out = out.transpose(2, 3).reshape(B, N_q, D)
-        out = self.out_proj(out)
-        
-        return out, None # 返回 None 作为 attn_weights 占位符，因为线性注意力没有显式的 N*N 权重矩阵
-
-class LinearAttention(nn.Module):
-    """
-    通用线性注意力 (支持 Self 和 Cross Attention)
-    允许 query_len != key_len == value_len
-    复杂度: O((N_q + N_k) * d^2)
-    """
-    def __init__(self, embed_dim, n_heads, dropout=0.1):
-        super().__init__()
-        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
-        
-        self.embed_dim = embed_dim
-        self.n_heads = n_heads
-        self.head_dim = embed_dim // n_heads
-        
-        # 独立的投影层，支持 Q, K, V 维度独立变换
+        # 独立的投影层，允许 Q, K, V 来自不同的分布或长度
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         
         self.dropout = nn.Dropout(dropout)
-        # 特征映射: ELU + 1 保证正值，用于线性化 Softmax
+        # 特征映射: phi(x) = ELU(x) + 1，保证输出为正，用于线性化注意力
         self.feature_map = lambda x: F.elu(x) + 1.0
 
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, key_padding_mask=None):
         """
-        query: [B, N_q, D]
-        key:   [B, N_k, D]
-        value: [B, N_k, D]
-        注意: N_q 可以不等于 N_k
+        参数:
+            query: [Batch, N_q, Embed_Dim]
+            key:   [Batch, N_k, Embed_Dim]
+            value: [Batch, N_k, Embed_Dim]
+            key_padding_mask: [Batch, N_k] (可选，布尔掩码，True表示忽略)
+            
+        返回:
+            output: [Batch, N_q, Embed_Dim]
         """
         B, N_q, D = query.shape
         N_k = key.shape[1]
         
         # 1. 线性投影
-        q = self.q_proj(query)  # [B, N_q, D]
-        k = self.k_proj(key)    # [B, N_k, D]
-        v = self.v_proj(value)  # [B, N_k, D]
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
         
-        # 2. 多头拆分: [B, N, D] -> [B, Heads, N, Head_Dim]
+        # 2. 多头变换: [B, N, D] -> [B, Heads, N, Head_Dim]
         q = q.reshape(B, N_q, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(B, N_k, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, N_k, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # 3. 特征映射 (Kernel Feature Map)
+        # 3. 应用特征映射 (Feature Map)
+        # Q 和 K 需要映射到正空间，V 不需要
         q = self.feature_map(q)
         k = self.feature_map(k)
-        # v 不需要特征映射，直接参与加权求和
         
-        # 4. 线性注意力核心计算
-        # 目标: 计算 (Softmax(QK^T) @ V) 的线性近似
-        # 公式: (phi(Q) @ (phi(K)^T @ V)) / (phi(Q) @ (phi(K)^T @ 1))
+        # 4. 处理 Padding (如果有)
+        if key_padding_mask is not None:
+            # mask shape: [B, N_k] -> [B, 1, 1, N_k]
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            # 将 K 和 V 中 padding 位置置为 0
+            k = k.masked_fill(mask, 0.0)
+            v = v.masked_fill(mask, 0.0)
+            
+        # 5. 线性注意力核心计算 (Linear Attention Mechanism)
+        # 标准注意力: Softmax(QK^T)V
+        # 线性注意力: (phi(Q) * (phi(K)^T * V)) / (phi(Q) * (phi(K)^T * 1))
         
-        # Step 4.1: 计算全局状态 KV (Global State)
+        # Step 5.1: 计算全局状态矩阵 KV (Global State Matrix)
         # k: [B, H, N_k, h], v: [B, H, N_k, h]
-        # kv: [B, H, h, h]  <-- 这个矩阵大小与序列长度 N_k 无关!
+        # kv: [B, H, h, h]  <-- 注意：这里消去了 N_k 维度！
+        # 公式: sum_{n=1}^{N_k} (k_n^T * v_n)
         kv = torch.einsum("bhnd,bhnm->bhdm", k, v)
         
-        # Step 4.2: 计算归一化分母
-        # k_sum: [B, H, h] (对 N_k 维度求和)
+        # Step 5.2: 计算归一化分母 (Normalizer)
+        # k_sum: [B, H, h] <-- 对 N_k 求和
         k_sum = k.sum(dim=2)
-        # z: [B, H, N_q] = q @ k_sum
+        
+        # z: [B, H, N_q]
+        # 公式: q_n * sum(k)
         z = torch.einsum("bhnd,bhd->bhn", q, k_sum)
-        # 避免除零
+        
+        # 防止除零，添加小量 epsilon
         z = 1.0 / (z + 1e-6)
         
-        # Step 4.3: 计算输出
-        # out: [B, H, N_q, h] = (q @ kv) * z
-        # 先算 q @ kv: [B, H, N_q, h] @ [B, H, h, h] -> [B, H, N_q, h]
-        out = torch.einsum("bhnd,bhdm->bhnm", q, kv) # 注意 einsum 下标对应
-        # 修正 einsum: 
-        # q: [B, H, N_q, h] (bhnd)
-        # kv: [B, H, h, h] (bhdm) -> 这里的 d 是 head_dim, m 也是 head_dim
-        # 结果应该是 [B, H, N_q, m] (即 head_dim)
-        # 正确的 einsum: bhnd, bhdm -> bhnm
-        out = torch.einsum("bhnd,bhdm->bhnm", q, kv)
+        # Step 5.3: 计算最终输出
+        # out_raw: [B, H, N_q, h]
+        # 公式: q_n * KV_matrix
+        out_raw = torch.einsum("bhnd,bhdm->bhnm", q, kv)
         
         # 应用归一化
-        out = out * z.unsqueeze(-1)
+        out = out_raw * z.unsqueeze(-1)
         
-        # 5. 合并多头并输出投影
+        # 6. 合并多头并投影输出
         # [B, H, N_q, h] -> [B, N_q, H*h] -> [B, N_q, D]
         out = out.transpose(1, 2).reshape(B, N_q, D)
         out = self.out_proj(out)
         
+        # 可选：Dropout
+        out = self.dropout(out)
+        
         return out
 
-class LinearEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+class LinearTransformerBlock(nn.Module):
+    """
+    标准的 Transformer Encoder Block
+    包含: Linear Self-Attention + MLP + LayerNorm + Residual
+    """
+    def __init__(self, d_model, n_heads, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        # Encoder 内部是 Self-Attention (Q=K=V)
-        self.self_attn = LinearAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = LinearAttention(d_model, n_heads, dropout=dropout)
+        
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.activation = F.gelu
-        
-    def forward(self, src):
-        # Self Attention
-        attn_out = self.self_attn(src, src, src)
-        src = src + self.dropout(attn_out)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # Self Attention (Q=K=V=src)
+        attn_output = self.self_attn(src, src, src, key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout1(attn_output)
         src = self.norm1(src)
         
-        # FFN
-        ff_out = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + ff_out
+        # Feed Forward Network
+        ff_output = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(ff_output)
         src = self.norm2(src)
+        
         return src
 
 class FvcomTransformer(nn.Module):
-    def __init__(self, node=60882, triangle=115443, node_var=13,
-                 triangle_var=17, embed_dim=256, n_heads=8, num_transformer_layers=6,
+    """
+    FVCOM 专用线性 Transformer 架构
+    
+    架构流程:
+    1. Input Embedding: Node 和 Triangle 分别映射到 D 维。
+    2. Concatenation: 拼接成 [B, N_node+N_tri, D] 全局序列。
+    3. Global Encoder: N 层 Linear Self-Attention，实现 17w 点的全局信息交互。
+    4. Split & Decode: 
+       - Node Branch: Q=Node_Features, KV=Global_Context (Cross Attention)
+       - Tri Branch:  Q=Tri_Features,  KV=Global_Context (Cross Attention)
+    5. Output Heads: 预测下一时刻物理量。
+    """
+    def __init__(self, 
+                 node=60882, 
+                 triangle=115443, 
+                 node_var=13, 
+                 triangle_var=17,
+                 node_out_features=9,   # 例如: 预测水位, u, v, temp, salt... (原13 - 5个静态/坐标)
+                 triangle_out_features=8, # 例如: 预测某些单元属性 (原17 - 4个静态/坐标)
+                 embed_dim=256,
+                 n_heads=4,
+                 num_transformer_layers=2, 
+                 dim_feedforward=1024, 
                  dropout=0.1):
         super().__init__()
         
-        # 1. 输入嵌入
-        self.node_embedding_layer = nn.Linear(node_var, embed_dim)
-        self.triangle_embedding_layer = nn.Linear(triangle_var, embed_dim)
-
-        # 2. 全局编码器 (Self-Attention on Concatenated Sequence)
+        self.node_num = node
+        self.triangle_num = triangle
+        self.embed_dim = embed_dim
+        
+        # --- 1. 输入嵌入层 ---
+        self.node_embedding = nn.Linear(node_var, embed_dim)
+        self.triangle_embedding = nn.Linear(triangle_var, embed_dim)
+        
+        # --- 2. 全局编码器 (Global Encoder) ---
+        # 处理拼接后的 17w 序列
         encoder_layers = [
-            LinearEncoderLayer(d_model=embed_dim, nhead=n_heads, 
-                               dim_feedforward=embed_dim*4, dropout=dropout)
-            for _ in range(num_transformer_layers)
+            LinearTransformerBlock(
+                d_model=embed_dim, 
+                n_heads=n_heads, 
+                dim_feedforward=dim_feedforward, 
+                dropout=dropout
+            ) for _ in range(num_transformer_layers)
         ]
         self.global_encoder = nn.ModuleList(encoder_layers)
         
-        # 3. 解码器交叉注意力 (Cross-Attention)
-        # Q 是分离的 (Node/Tri), KV 是全局的
-        # 这里复用同一个 LinearAttention 类，因为它支持 Cross Attention
-        self.cross_att_node = LinearAttention(embed_dim, n_heads, dropout=dropout)
-        self.cross_att_tri = LinearAttention(embed_dim, n_heads, dropout=dropout)
+        # --- 3. 解码器交叉注意力 (Decoder Cross-Attention) ---
+        # 这里的 LinearAttention 专门用于 Cross Attention (Q_len != KV_len)
+        self.node_decoder_attn = LinearAttention(embed_dim, n_heads, dropout=dropout)
+        self.tri_decoder_attn = LinearAttention(embed_dim, n_heads, dropout=dropout)
         
-        # 4. 输出头
-        self.node_out_head = nn.Linear(embed_dim, max(1, 9)) 
-        self.elem_out_head = nn.Linear(embed_dim, max(1, 8))
+        # --- 4. 输出预测头 ---
+        self.node_head = nn.Linear(embed_dim, node_out_features)
+        self.triangle_head = nn.Linear(embed_dim, triangle_out_features)
+        
+        # 初始化权重
+        self._init_weights()
 
-    def forward(self, node_in, triangle_in):
-        # 处理输入维度 (兼容 [B, 1, N, D] 或 [B, N, D])
-        # if node_in.dim() == 3 and node_in.size(1) == 1:
-        #     node_in = node_in.squeeze(1)
-        # if triangle_in.dim() == 3 and triangle_in.size(1) == 1:
-        #     triangle_in = triangle_in.squeeze(1)
-        node_in = node_in.squeeze(0)
-        triangle_in = triangle_in.squeeze(0)
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, node_data, triangle_data, node_mask=None, triangle_mask=None):
+        """
+        参数:
+            node_data: [Batch, N_node, Node_Features]
+            triangle_data: [Batch, N_tri, Tri_Features]
+            node_mask: [Batch, N_node] (可选，布尔值，True为Padding)
+            triangle_mask: [Batch, N_tri] (可选)
             
-        b = node_in.size(0)
+        返回:
+            node_pred: [Batch, N_node, Node_Out_Features]
+            tri_pred: [Batch, N_tri, Tri_Out_Features]
+        """
+        node_data = node_data.squeeze(1)
+        triangle_data = triangle_data.squeeze(1)
+        print(node_data.shape)
+        print(triangle_data.shape)
+        B = node_data.size(0)
+        device = node_data.device
         
         # --- Step 1: Embedding ---
-        print(node_in.shape)
-        print(triangle_in.shape)
-        node_feats = self.node_embedding_layer(node_in)      # [B, N_node, D]
-        triangle_feats = self.triangle_embedding_layer(triangle_in) # [B, N_tri, D]
-
-        # --- Step 2: Concatenate for Global Context ---
-        # 拼接: [B, N_node + N_tri, D] (~17w)
-        combined_input = torch.cat([node_feats, triangle_feats], dim=1)
-        n_node = node_feats.size(1)
+        # [B, N_node, D]
+        node_emb = self.node_embedding(node_data)
+        # [B, N_tri, D]
+        tri_emb = self.triangle_embedding(triangle_data)
         
-        # --- Step 3: Global Encoder (Self-Attention) ---
-        # 17w 个点互相做注意力，更新特征
-        global_context = combined_input
+        # --- Step 2: Concatenation (构建全局场) ---
+        # [B, N_total, D]  where N_total = N_node + N_tri
+        global_input = torch.cat([node_emb, tri_emb], dim=1)
+        
+        # 构建全局 Mask (如果需要)
+        global_mask = None
+        if node_mask is not None or triangle_mask is not None:
+            if node_mask is None: node_mask = torch.zeros(B, self.node_num, dtype=torch.bool, device=device)
+            if triangle_mask is None: triangle_mask = torch.zeros(B, self.triangle_num, dtype=torch.bool, device=device)
+            global_mask = torch.cat([node_mask, triangle_mask], dim=1)
+        
+        # --- Step 3: Global Encoding (Self-Attention) ---
+        # 所有节点和单元在此阶段互相交换信息
+        global_context = global_input
         for layer in self.global_encoder:
-            global_context = layer(global_context)
-        # global_context shape: [B, N_total, D]
+            global_context = layer(global_context, src_key_padding_mask=global_mask)
         
-        # --- Step 4: Decoder (Cross-Attention) ---
-        # 策略: 
-        # Node Branch: Q=node_feats (原始或嵌入后的), KV=global_context
-        # Tri Branch:  Q=tri_feats, KV=global_context
-        # 这样每个节点/单元都能从全局上下文中“检索”相关信息
+        # --- Step 4: Decoding with Cross-Attention ---
+        # 策略：
+        # Query: 使用全局上下文中对应的部分 (已经包含了局部交互信息)
+        # Key/Value: 使用完整的全局上下文 (让每个点重新审视全场)
         
-        # 使用原始的嵌入特征作为 Query (保留输入细节)，也可以使用 global_context 切片作为 Query
-        # 这里选择使用 global_context 切分后作为 Query，因为经过 Encoder 后 Query 本身也包含了局部上下文
-        # 如果你想用纯原始输入作为 Query，可以用 node_feats / triangle_feats 替换下面的 query_node/query_tri
+        # 分割全局上下文
+        # global_context[:, :self.node_num, :] -> Node 部分
+        # global_context[:, self.node_num:, :] -> Triangle 部分
+        node_query = global_context[:, :self.node_num, :]
+        tri_query = global_context[:, self.node_num:, :]
         
-        query_node = global_context[:, :n_node, :]       # [B, N_node, D]
-        query_tri = global_context[:, n_node:, :]        # [B, N_tri, D]
+        # Key 和 Value 都是完整的全局场
+        global_kv = global_context
         
-        # Key & Value 都是完整的全局上下文
-        key_global = global_context
-        value_global = global_context
-        
-        # Cross Attention: Node
+        # Node 分支 Cross Attention
         # Q: [B, N_node, D], K: [B, N_total, D], V: [B, N_total, D]
-        # Output: [B, N_node, D]
-        node_out_feats = self.cross_att_node(query_node, key_global, value_global)
+        # 输出: [B, N_node, D]
+        node_decoded = self.node_decoder_attn(
+            query=node_query, 
+            key=global_kv, 
+            value=global_kv,
+            key_padding_mask=global_mask
+        )
         
-        # Cross Attention: Triangle
+        # Triangle 分支 Cross Attention
         # Q: [B, N_tri, D], K: [B, N_total, D], V: [B, N_total, D]
-        # Output: [B, N_tri, D]
-        tri_out_feats = self.cross_att_tri(query_tri, key_global, value_global)
+        # 输出: [B, N_tri, D]
+        tri_decoded = self.tri_decoder_attn(
+            query=tri_query, 
+            key=global_kv, 
+            value=global_kv,
+            key_padding_mask=global_mask
+        )
         
-        # --- Step 5: Output Heads ---
-        next_node_state = self.node_out_head(node_out_feats) 
-        next_elem_state = self.elem_out_head(tri_out_feats)
+        # --- Step 5: Output Projection ---
+        node_pred = self.node_head(node_decoded)
+        tri_pred = self.triangle_head(tri_decoded)
         
-        return next_node_state, next_elem_state
+        return node_pred, tri_pred
 
-    def predict(self, node_input_data, triangle_input_data, checkpoint_name):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(checkpoint_name, map_location=device)
-        self.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        self.to(device)
+    def predict_step(self, node_data, triangle_data):
+        """
+        封装用于推理的单步预测方法
+        """
         self.eval()
-        
-        node_input_data = node_input_data.to(device)
-        triangle_input_data = triangle_input_data.to(device)
-
         with torch.no_grad():
-            output = self(node_input_data, triangle_input_data)
-        return output
+            return self.forward(node_data, triangle_data)
 
 
 def run_test():
@@ -407,9 +408,9 @@ def run_test():
 
         NODE_VAR = 13
         TRI_VAR = 17
-        EMBED_DIM = 256
-        N_HEADS = 8
-        NUM_LAYERS = 6      # 测试时减少层数以加快速度
+        EMBED_DIM = 128
+        N_HEADS = 2
+        NUM_LAYERS = 2      # 测试时减少层数以加快速度
         DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         print(f"设备: {DEVICE}")
