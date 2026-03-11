@@ -88,8 +88,8 @@ class FvcomDataset(Dataset):
             torch.from_numpy(node_input),
             torch.from_numpy(triangle_input)
         ), (
-            torch.from_numpy(node_target),
-            torch.from_numpy(triangle_target)
+            torch.from_numpy(node_target[:,:-5]),
+            torch.from_numpy(triangle_target[:,:-4])
         )
 
 class FvcomTransformer(nn.Module):
@@ -137,8 +137,8 @@ class FvcomTransformer(nn.Module):
 
         self.cross_att_out = nn.MultiheadAttention(embed_dim, n_heads, batch_first=True)
         
-        self.node_out_head = nn.Linear(embed_dim, node_var)
-        self.elem_out_head = nn.Linear(embed_dim, triangle_var)
+        self.node_out_head = nn.Linear(embed_dim, node_var[:,:-5])
+        self.elem_out_head = nn.Linear(embed_dim, triangle_var[:,:-4])
 
         # self.node_head = nn.Sequential(
         #     nn.LayerNorm(embed_dim),
