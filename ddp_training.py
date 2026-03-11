@@ -36,8 +36,8 @@ def train_zero_epoch_ddp(
     torch.cuda.set_device(local_rank)
 
     model = fvcomtransformer.FvcomModel(
-        node=60882, triangle=115443, node_var=11,
-        triangle_var=15, embed_dim=256,
+        node=60882, triangle=115443, node_var=13,
+        triangle_var=17, embed_dim=256,
         n_heads=8, num_transformer_layers=6, dropout=0.1
     ).to(device)
 
@@ -252,7 +252,7 @@ def main():
                          checkpoint_name_out="checkpoints/" + timestamp_str+ "_ddp_training.pth",
                          total_timesteps=144*7,
                          input_steps=1,
-                         pred_step=36)
+                         pred_step=1)
     # train_from_pth_ddp(node_data_dir="dataset/node/data/",
     #                    tri_data_dir="dataset/triangle/data/",
     #                    num_epochs=100,

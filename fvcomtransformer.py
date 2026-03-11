@@ -84,7 +84,6 @@ class FvcomDataset(Dataset):
 
         node_target = self._load_sequence(self.node_data_dir, self.node_files, t_target, 1).squeeze(0)
         triangle_target = self._load_sequence(self.triangle_data_dir, self.triangle_files, t_target, 1).squeeze(0)
-        
         return (
             torch.from_numpy(node_input),
             torch.from_numpy(triangle_input)
@@ -94,8 +93,8 @@ class FvcomDataset(Dataset):
         )
 
 class FvcomTransformer(nn.Module):
-    def __init__(self, node=60882, triangle=115443, node_var=11,
-                 triangle_var=15, embed_dim=256, n_latents=512, n_heads=8, num_transformer_layers=6,
+    def __init__(self, node=60882, triangle=115443, node_var=13,
+                 triangle_var=17, embed_dim=256, n_latents=512, n_heads=8, num_transformer_layers=6,
                  dropout=0.1):
         super().__init__()
         
@@ -125,13 +124,13 @@ class FvcomTransformer(nn.Module):
         )
 
         self.node_to_query = nn.Sequential(
-            nn.Linear(11, 128),
+            nn.Linear(2, 128),
             nn.GELU(),
             nn.Linear(128, embed_dim)
         )
 
         self.triangle_to_query = nn.Sequential(
-            nn.Linear(15, 128),
+            nn.Linear(2, 128),
             nn.GELU(),
             nn.Linear(128, embed_dim)
         )
@@ -175,8 +174,8 @@ class FvcomTransformer(nn.Module):
         
         latent_feats = self.latent_transformer(latent_feats)
         
-        node_q = self.node_to_query(node_in)
-        elem_q = self.triangle_to_query(triangle_in)
+        node_q = self.node_to_query(node_in[:,:,-2:])
+        elem_q = self.triangle_to_query(triangle_in[:,:,-2:])
         
         node_out_feats, _ = self.cross_att_out(query=node_q, 
                                                key=latent_feats, 
@@ -204,7 +203,7 @@ class FvcomTransformer(nn.Module):
         return output
 
 def FvcomModel(node=60882, triangle=115443, node_var=13,
-               triangle_var=18, embed_dim=256,
+               triangle_var=17, embed_dim=256,
                n_latents=512, n_heads=8, num_transformer_layers=6,
                dropout=0.1):
     
