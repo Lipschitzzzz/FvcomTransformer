@@ -38,7 +38,7 @@ def train_zero_epoch_ddp(
     model = fvcomtransformer.FvcomModel(
         node=60882, triangle=115443, node_var=13,
         triangle_var=17, embed_dim=256,
-        n_heads=8, num_transformer_layers=6, dropout=0.1
+        n_heads=4, num_transformer_layers=4, dropout=0.1
     ).to(device)
 
     full_dataset = fvcomtransformer.FvcomDataset(
