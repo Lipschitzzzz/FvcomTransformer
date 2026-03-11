@@ -160,7 +160,7 @@ class FvcomTransformer(nn.Module):
     def forward(self, node_in, triangle_in):
         node_in = node_in.squeeze(0)
         triangle_in = triangle_in.squeeze(0)
-        print(node_in.shape)
+        # print(node_in.shape)
         b = node_in.size(0)
         node = self.node_embedding_layer(node_in)
         triangle = self.triangle_embedding_layer(triangle_in)
